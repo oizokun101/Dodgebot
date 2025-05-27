@@ -1,6 +1,18 @@
 import numpy as np
 from collections import defaultdict
 import math
+import random
+from obstacle_move import MovingMap, OCCUPIED, FREE, UNKNOWN, MAP_TOPIC, GRID_HEIGHT, GRID_WIDTH
+
+from nav_msgs.msg import OccupancyGrid
+import rclpy
+from rclpy.node import Node
+
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped
+
+FREQUENCY = 10
+
 
 # Direction definitions
 RIGHT = 0
@@ -17,10 +29,10 @@ TURN_LEFT = 2
 TURN_RIGHT = 3
 
 # Reward definitions
-GOAL_REWARD = 20
-CLOSER_REWARD = 0.2
-TIMESTEP_REWARD = -0.1
-COLLISION_REWARD = -30
+GOAL_REWARD = 500
+CLOSER_REWARD = 0. # Not using right now
+TIMESTEP_REWARD = -0.2
+COLLISION_REWARD = -40
 
 class State:
   def __init__(self, radius_map, goal_dir):
@@ -37,95 +49,293 @@ class Location:
   def __init__(self, x, y):
     self.x = x
     self.y = y
+
+  def __eq__(self, value):
+    return self.x == value.x and self.y == value.y
+  
+  def __str__(self):
+      return str((self.x, self.y))
+  def __repr__(self):
+        return self.__str__()
   
 class RobotInfo:
-  def __init__(self, location, direction, goal_loc, scan_radius, map_height, map_width, q_table = None):
-    self.location = location
-    self.direction = direction
-    self.goal_loc = goal_loc
-    self.scan_radius = scan_radius
-    self.map_height = map_height
-    self.map_width = map_width
+    def __init__(self, location, direction, goal_loc, scan_radius, map_height, map_width, q_table = None):
+        self.location = location
+        self.direction = direction
+        self.goal_loc = goal_loc
+        self.scan_radius = scan_radius
+        self.map_height = map_height
+        self.map_width = map_width
 
-    self.current_state = None
+        self.previous_map = None
+        self.decay_map = np.zeros(())
 
-    self.q_table = defaultdict(lambda: 0)
+        self.current_state = None
+
+        if q_table is None:
+            self.q_table = defaultdict(lambda: 0)
+        else:
+            self.q_table = q_table
 
   # This will have to be changed when we make it actually process laser scans
-  def get_state(self, map):
-    radius = map[max(0, self.goal_loc.y - self.scan_radius):min(self.map_height-1, self.goal_loc.y + self.scan_radius), 
-               max(0, self.goal_loc.x - self.scan_radius):min(self.map_width-1, self.goal_loc.x + self.scan_radius)]
+    def get_state(self, map):
+        updated_map = map.copy()
+
+        if(self.previous_map is not None):
+            updated_map, updated_decay = self.update_change_tracker(self.previous_map, map, self.decay_map)
+        else:
+            updated_decay = np.zeros_like(updated_map)
+
+        radius = updated_map[max(0, self.goal_loc.y - self.scan_radius):min(self.map_height-1, self.goal_loc.y + self.scan_radius), 
+                max(0, self.goal_loc.x - self.scan_radius):min(self.map_width-1, self.goal_loc.x + self.scan_radius)]
+        
+        radius = np.rot90(radius, self.direction)
+        scan = self.scan(radius)
+        
+        self.current_state = State(scan, self.get_goal_dir())
+
+        self.previous_map = updated_map
+        self.decay_map = updated_decay
+        return self.current_state
     
-    scan = self.scan(radius)
+    def scan(self, radius,  num_rays=60):
+        scan = np.ones_like(radius) * -1 # start as unknown
+
+        cx, cy = self.location.x, self.location.y
+
+        h, w, = radius.shape
+
+        for angle in np.linspace(0, 2 * np.pi, num=num_rays, endpoint=False):
+            dx = math.cos(angle)
+            dy = math.sin(angle)
+
+            x, y = cx, cy  # start exactly at the robot's position
+
+            for step in range(max(h, w) * 4):  # march far enough
+                ix, iy = int(x), int(y)
+                if not (0 <= ix < h and 0 <= iy < w):
+                    break
+
+                if radius[ix, iy] == 100:
+                    break
+
+                scan[ix, iy] = 0  # mark visible
+                x += dx * 0.2  # smaller steps for smoother rays
+                y += dy * 0.2 
+
+        return scan
+
+    def update_change_tracker(self, prev_map, curr_map, decay_map):
+        """
+        Track cells that changed from 100 → 0 for 3 iterations.
+
+        - prev_map: map from previous iteration
+        - curr_map: current scan result
+        - decay_map: same shape as maps, initially all zeros
+        Returns:
+        - new_map: copy of curr_map with 200s for tracked disappearing obstacles
+        - updated_decay_map: new decay values
+        """
+        new_map = curr_map.copy()
+        updated_decay = np.maximum(decay_map - 1, 0)
+
+        # Detect obstacle disappearance: 100 → 0
+        disappear_mask = (prev_map == 100) & (curr_map == 0)
+        updated_decay[disappear_mask] = 3  # restart countdown
+
+        # Apply visual mark
+        new_map[updated_decay > 0] = 200
+
+        return new_map, updated_decay
+
+    def get_goal_dir(self):
+        dx = self.goal_loc.x - self.location.x
+        dy = self.goal_loc.y - self.location.y
+
+        if abs(dx) > abs(dy):  # horizontal move dominates
+            return RIGHT if dx > 0 else LEFT
+        elif abs(dy) > 0:  # vertical move dominates
+            return DOWN if dy > 0 else UP
+        else:
+            return SAME 
     
-    self.current_state = State(scan, self.get_goal_dir())
-    return self.current_state
+    def turn_dir(self, turn_dir):
+        if turn_dir == TURN_LEFT:
+            self.direction = (self.direction - 1) % 4
+        elif turn_dir ==TURN_RIGHT:
+            self.direction = (self.direction + 1) % 4
     
-  def scan(self, radius,  num_rays=60):
-    scan = np.ones_like(radius) * -1 # start as unknown
+    def move(self, direction):
+        if direction == FORWARD:
+            step = 1
+        elif direction ==  BACKWARD:
+            step = -1
+        else:
+            return
 
-    cx, cy = self.location.x, self.location.y
+        if self.direction == RIGHT:
+            self.location.x = max(0, min(self.location.x + step, self.map_width - 1))
+        elif self.direction == LEFT:
+            self.location.x = max(0, min(self.location.x - step, self.map_width - 1))
+        elif self.direction == UP:
+            self.location.y = max(0, min(self.location.y + step, self.map_height - 1))
+        elif self.direction == DOWN:
+            self.location.y = max(0, min(self.location.y - step, self.map_height - 1))
+  
+    def get_best_value(self):
+        actions = [FORWARD, BACKWARD, TURN_LEFT, TURN_RIGHT, STOP]
+        return max([self.q_table[(self.current_state, action)] for action in actions])
 
-    h, w, = radius.shape
+class QLearner:
 
-    for angle in np.linspace(0, 2 * np.pi, num=num_rays, endpoint=False):
-        dx = math.cos(angle)
-        dy = math.sin(angle)
+    def __init__(self, robot_info, training_rounds, map_node, alpha=0.3, gamma=0.9, epsilon=1.0, decay=(1 - 3e-4)):
+        self.robot_info = robot_info
+        self.training_rounds = training_rounds
+        self.map_node = map_node
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.decay = decay
 
-        x, y = cx, cy  # start exactly at the robot's position
+    def play_round(self, start, goal):
+        print(f"Playing round from {start} to {goal} with epsilon {self.epsilon}")
+        
+        self.reset(start, goal)
 
-        for step in range(max(h, w) * 4):  # march far enough
-            ix, iy = int(x), int(y)
-            if not (0 <= ix < h and 0 <= iy < w):
+        step_limit = 500
+        step = 0
+        path = []
+        total_reward = 0
+        while(goal != self.robot_info.location and step < step_limit):
+            cur_map = self.map_node.grid
+            state = self.robot_info.get_state(cur_map)
+            action = self.get_exploration_action(self.epsilon)
+            self.take_action(action)
+            reward = self.get_reward(cur_map)
+            total_reward += reward
+
+            prev_value = self.robot_info.q_table[(state,action)]
+
+            self.robot_info.q_table[(state,action)] = (1 - self.alpha) * prev_value + self.alpha * (reward + self.gamma * self.robot_info.get_best_value())
+
+            step += 1
+            path.append(Location(self.robot_info.location.x, self.robot_info.location.y))
+            if reward == COLLISION_REWARD:
+                print("Collided!")
                 break
+        self.epsilon *= self.decay
+        if self.robot_info.location == goal:
+            print("Found goal")
+        print(f"Reward: {total_reward}")
+        print(path)
+        return path
 
-            if radius[ix, iy] == 100:
-                break
-
-            scan[ix, iy] = 0  # mark visible
-            x += dx * 0.2  # smaller steps for smoother rays
-            y += dy * 0.2 
-
-    return scan
-
+    def get_exploration_action(self, epsilon):
+        if random.random() > epsilon:
+            return self.get_best_action()
+        else:
+            return random.choice([FORWARD, BACKWARD, TURN_LEFT, TURN_RIGHT, STOP])
     
+    def get_reward(self, map):
+        if map[self.robot_info.location.y, self.robot_info.location.x] == OCCUPIED:
+            return COLLISION_REWARD
+        elif self.robot_info.location == self.robot_info.goal_loc:
+            return GOAL_REWARD
+        else: return TIMESTEP_REWARD
 
-  def get_goal_dir(self):
-    dx = self.goal_loc.x - self.location.x
-    dy = self.goal_loc.y - self.location.y
+    def get_best_action(self):
+        actions = [FORWARD, BACKWARD, TURN_LEFT, TURN_RIGHT, STOP]
+        state = self.robot_info.get_state(self.map_node.grid)
+        return max(actions, key=lambda a: self.robot_info.q_table[(state, a)])
+  
+    def reset(self, start: Location, goal: Location):
+        print(f"reseting location to {start}, {goal}")
+        self.robot_info.location = Location(start.x, start.y)
+        self.robot_info.goal = Location(goal.x, goal.y)
 
-    if abs(dx) > abs(dy):  # horizontal move dominates
-        return RIGHT if dx > 0 else LEFT
-    elif abs(dy) > 0:  # vertical move dominates
-        return DOWN if dy > 0 else UP
-    else:
-        return SAME 
-    
-  def turn_dir(self, turn_dir):
-    if turn_dir == TURN_LEFT:
-      self.direction = (self.direction - 1) % 4
-    elif turn_dir ==TURN_RIGHT:
-      self.direction = (self.direction + 1) % 4
-    
-  def move(self, direction):
-    if direction == FORWARD:
-      step = 1
-    elif direction ==  BACKWARD:
-      step = -1
-    else:
-      return
-    
-    if self.direction == RIGHT:
-      self.location.x = max(0, min(self.location.x + step, self.map_width))
-    elif self.direction == LEFT:
-      self.location.x = max(0, min(self.location.x - step, self.map_width))
-    elif self.direction == UP:
-      self.location.y = max(0, min(self.location.y + step, self.map_height))
-    elif self.direction == DOWN:
-      self.location.y = max(0, min(self.location.y - step, self.map_height))
+    def take_action(self, action):
+        if action in [FORWARD, BACKWARD]:
+            self.robot_info.move(action)
+        elif action in [TURN_LEFT, TURN_RIGHT]:
+            self.robot_info.turn_dir(action)
 
-  def get_best_action(self):
-    actions = [FORWARD, BACKWARD, TURN_LEFT, TURN_RIGHT, STOP]
-    return max([self.q_table[(self.current_state, action)] for action in actions])
+class QLearningNode(Node):
+    def __init__(self, robot_info, episodes=1000):
+        super().__init__('q_learning_node')
+        self.sub = self.create_subscription(
+            OccupancyGrid, 
+            MAP_TOPIC, 
+            self.map_callback, 
+            1)
+        
+        # Path publisher
+        self.path_pub = self.create_publisher(Path, '/q_learning/path', 10)
+        
+        self.latest_map = None
+        self.robot_info = robot_info
+        self.learner = QLearner(robot_info, training_rounds=episodes, map_node=self)
+        
+        self.timer = self.create_timer(1.0 / FREQUENCY, self.train_loop)
+        self.start = Location(1, 1)
+        self.goal = Location(GRID_WIDTH - 2, GRID_HEIGHT - 2)
+
+    def map_callback(self, msg: OccupancyGrid):
+        grid = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
+        self.latest_map = grid
+
+    def publish_path(self, path_locs: list):
+        path_msg = Path()
+        path_msg.header.frame_id = 'map'
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+
+        for loc in path_locs:
+            pose = PoseStamped()
+            pose.header.frame_id = 'map'
+            pose.header.stamp = self.get_clock().now().to_msg()
+            pose.pose.position.x = float(loc.x)
+            pose.pose.position.y = float(loc.y)
+            pose.pose.position.z = 0.0
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+
+        self.path_pub.publish(path_msg)
+
+    def train_loop(self):
+        if self.latest_map is None:
+            return
+        self.grid = self.latest_map.copy()
+        path = self.learner.play_round(self.start, self.goal)
+
+        self.publish_path(path)
+        
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    map_node = MovingMap()
+    robot_info = RobotInfo(
+        location=Location(1, 1),
+        direction=RIGHT,
+        goal_loc=Location(GRID_WIDTH - 2, GRID_HEIGHT - 2),
+        scan_radius=3,
+        map_height=GRID_HEIGHT,
+        map_width=GRID_WIDTH
+    )
+    learner_node = QLearningNode(robot_info)
+
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(map_node)
+    executor.add_node(learner_node)
+
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        map_node.destroy_node()
+        learner_node.destroy_node()
+        rclpy.shutdown()
 
 
+if __name__ == '__main__':
+    main()

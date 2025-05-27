@@ -13,7 +13,7 @@ TF_ODOM_LINK = 'odom'
 RESOLUTION = 0.05  # meters
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
-FREQUENCY = 10  # Hz
+FREQUENCY = 1  # Hz
 
 UNKNOWN = -1
 FREE = 0
@@ -30,11 +30,11 @@ class DynamicRect:
         self.row += self.d_row
         self.col += self.d_col
         # Bounce on vertical walls
-        if self.col <= 0 or self.col >= width-2:
+        if self.col <= 0 or self.col >= width-1:
             self.d_col *= -1
             self.col  += self.d_col          # move back inside
         # Bounce on horizontal walls
-        if self.row <= 0 or self.row >= height-2:
+        if self.row <= 0 or self.row >= height-1:
             self.d_row *= -1
             self.row  += self.d_row
 
@@ -59,40 +59,40 @@ class MovingMap(Node):
         self.width = GRID_WIDTH
 
         # Rate at which to operate the while loop.
-        self.rate = self.create_rate(FREQUENCY)
+        self.timer = self.create_timer(1.0 / FREQUENCY, self.publish_map)
 
         self._init_map()
 
     def _init_map(self):
-        self.grid: np.ndarray = np.full((self.height, self.width), UNKNOWN)
-        self.origin_x = - (self.width // 2) * self.resolution
-        self.origin_y = - (self.height // 2) * self.resolution
+        self.grid: np.ndarray = np.full((self.height, self.width), FREE, dtype=np.int8)
+        self.origin_x = - (self.width / 2) * self.resolution
+        self.origin_y = - (self.height / 2) * self.resolution
         self.obstacles = [
-            DynamicRect(self.height-2, self.width-2,  0, -1),   # right → left
-            DynamicRect(self.height//2, self.width//2, 1,  0),   # middle ↓ up
-            DynamicRect(2, 2,  0,  1)                   # left → right
+            DynamicRect(self.height-2, self.width-2,  0, -1),   # right moving left
+            DynamicRect(self.height//2, self.width//2, 1,  0),   # middle moving up
+            DynamicRect(2, 2,  0,  1)                   # left moving right
         ]
     
-    def make_header(clock):
+    def make_header(self):
         hdr = Header()
-        hdr.stamp = clock.now().to_msg()
+        hdr.stamp = self.get_clock().now().to_msg()
         hdr.frame_id = TF_ODOM_LINK
         return hdr
 
     def draw_obstacles(self):
-      self.grid.fill(0)
+      self.grid.fill(FREE)
       for obs in self.obstacles:
           r, c = obs.row, obs.col            # top-left
           self.grid[r  : r+2, c  : c+2] = 100   # 2×2 slice
 
-    def publish_grid(self):
+    def publish_map(self):
         # move every rectangle one cell
         for obs in self.obstacles:
             obs.step(self.height, self.width)
         
         self.draw_obstacles()
         msg = OccupancyGrid()
-        msg.header = self.make_header(self.get_clock())
+        msg.header = self.make_header()
 
         msg.info.resolution = self.resolution
         msg.info.height = self.height
@@ -102,7 +102,7 @@ class MovingMap(Node):
         msg.info.origin.orientation.w = 1.0
 
         msg.data = self.grid.flatten().tolist()
-        self.pub.publish(msg)
+        self._map_pub.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)

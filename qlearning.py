@@ -30,7 +30,7 @@ TURN_RIGHT = 3
 
 # Reward definitions
 GOAL_REWARD = 500
-CLOSER_REWARD = 0. # Not using right now
+CLOSER_REWARD = 0.3 # Not using right now
 TIMESTEP_REWARD = -0.2
 COLLISION_REWARD = -40
 
@@ -57,6 +57,8 @@ class Location:
       return str((self.x, self.y))
   def __repr__(self):
         return self.__str__()
+  def square_distance(self, other):
+      return (other.x - self.x)**2 + (other.y - self.y)**2
   
 class RobotInfo:
     def __init__(self, location, direction, goal_loc, scan_radius, map_height, map_width, q_table = None):
@@ -207,11 +209,19 @@ class QLearner:
         path = []
         total_reward = 0
         while(goal != self.robot_info.location and step < step_limit):
+            prev_distance = self.robot_info.location.square_distance(goal)
+
             cur_map = self.map_node.grid
             state = self.robot_info.get_state(cur_map)
             action = self.get_exploration_action(self.epsilon)
             self.take_action(action)
+            self.map_node.publish_map()
             reward = self.get_reward(cur_map)
+
+            new_distance = self.robot_info.location.square_distance(goal)
+            if(new_distance < prev_distance):
+                reward += CLOSER_REWARD
+
             total_reward += reward
 
             prev_value = self.robot_info.q_table[(state,action)]
@@ -260,7 +270,7 @@ class QLearner:
             self.robot_info.turn_dir(action)
 
 class QLearningNode(Node):
-    def __init__(self, robot_info, episodes=1000):
+    def __init__(self, robot_info, map_node, episodes=1000):
         super().__init__('q_learning_node')
         self.sub = self.create_subscription(
             OccupancyGrid, 
@@ -273,7 +283,7 @@ class QLearningNode(Node):
         
         self.latest_map = None
         self.robot_info = robot_info
-        self.learner = QLearner(robot_info, training_rounds=episodes, map_node=self)
+        self.learner = QLearner(robot_info, training_rounds=episodes, map_node=map_node)
         
         self.timer = self.create_timer(1.0 / FREQUENCY, self.train_loop)
         self.start = Location(1, 1)
@@ -301,9 +311,9 @@ class QLearningNode(Node):
         self.path_pub.publish(path_msg)
 
     def train_loop(self):
-        if self.latest_map is None:
-            return
-        self.grid = self.latest_map.copy()
+        # if self.latest_map is None:
+        #     return
+        # self.grid = self.latest_map.copy()
         path = self.learner.play_round(self.start, self.goal)
 
         self.publish_path(path)
@@ -321,10 +331,10 @@ def main(args=None):
         map_height=GRID_HEIGHT,
         map_width=GRID_WIDTH
     )
-    learner_node = QLearningNode(robot_info)
+    learner_node = QLearningNode(robot_info, map_node)
 
     executor = rclpy.executors.MultiThreadedExecutor()
-    executor.add_node(map_node)
+    # executor.add_node(map_node)
     executor.add_node(learner_node)
 
     try:

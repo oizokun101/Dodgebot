@@ -10,7 +10,7 @@ MAP_TOPIC = 'moving_map'
 USE_SIM_TIME = True
 TF_ODOM_LINK = 'odom'
 
-RESOLUTION = 0.05  # meters
+RESOLUTION = 1.0  # meters
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
 FREQUENCY = 1  # Hz

@@ -40,7 +40,7 @@ ACTIONS = [FORWARD, BACKWARD, TURN_LEFT, TURN_RIGHT, STOP]
 # Rewards
 GOAL_REWARD = 500
 CLOSER_REWARD = 10
-TIMESTEP_REWARD = -0.1
+TIMESTEP_REWARD = -1
 COLLISION_REWARD = -600
 
 DIR_TO_VEC = {
@@ -110,8 +110,7 @@ class DQNLearner:
         if random.random() < self.epsilon:
             return random.choice(ACTIONS)
         with torch.no_grad():
-            state_vector = self.get_full_state_vector(state)
-            state_tensor = torch.FloatTensor(state_vector).unsqueeze(0).to(DEVICE)
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
             q_values = self.policy_net(state_tensor)
             return ACTIONS[q_values.argmax().item()]
 
@@ -219,37 +218,38 @@ class DQNNode(Node):
         self.publish_path()
 
     def publish_path(self):
-        # Reset robot's location and goal
-        self.robot_info.location = Location(self.start.x, self.start.y)
-        self.robot_info.goal_loc = self.goal
+        # Use a copy of the robot for path simulation
+        simulated_robot = self.robot_info.copy()
+        simulated_robot.location = Location(self.start.x, self.start.y)
+        simulated_robot.goal_loc = self.goal
 
+        path = [Location(simulated_robot.location.x, simulated_robot.location.y)]
         max_steps = 500
-        path = [Location(self.robot_info.location.x, self.robot_info.location.y)]
 
         for _ in range(max_steps):
-            # Get current state
-            state_obj = self.robot_info.get_state(self.map_node.grid)
-            state_vector = self.get_full_state_vector(state_obj)
+            state_obj = simulated_robot.get_state(self.map_node.grid)
+            state_vector = self.learner.get_full_state_vector(state_obj)
             state_tensor = torch.FloatTensor(state_vector).unsqueeze(0).to(DEVICE)
 
-            # Get action from policy network
             with torch.no_grad():
                 q_values = self.learner.policy_net(state_tensor)
                 action_index = q_values.argmax().item()
                 action = ACTIONS[action_index]
 
-            # Simulate action and update robot_info's internal state
-            new_loc, new_direction = self.simulate_action(self.robot_info.location, self.robot_info.direction, action)
+            # Simulate action on the copied robot
+            if action in [FORWARD, BACKWARD]:
+                simulated_robot.move(action)
+            elif action in [TURN_LEFT, TURN_RIGHT]:
+                simulated_robot.turn_dir(action)
+            # STOP action does nothing
 
-            # If we hit an occupied cell, stop planning early
-            if self.map_node.grid[new_loc.y, new_loc.x] == OCCUPIED:
+            # If the new location is occupied, break
+            if self.map_node.grid[simulated_robot.location.y, simulated_robot.location.x] == OCCUPIED:
                 break
 
-            self.robot_info.location = new_loc
-            self.robot_info.direction = new_direction
-            path.append(Location(new_loc.x, new_loc.y))
+            path.append(Location(simulated_robot.location.x, simulated_robot.location.y))
 
-            if new_loc == self.goal:
+            if simulated_robot.location == self.goal:
                 break
 
         # Publish path as ROS message

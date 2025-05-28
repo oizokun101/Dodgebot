@@ -86,7 +86,8 @@ class MovingMap(Node):
       self.grid.fill(FREE)
       for obs in self.obstacles:
           r, c = obs.row, obs.col            # top-left
-          self.grid[r  : r+2, c  : c+2] = 100   # 2×2 slice
+        #   self.grid[r  : r+2, c  : c+2] = 100   # 2×2 slice
+          self.grid[r  : r+1, c  : c+1] = 100   # 2×2 slice
 
     def publish_map(self):
         # move every rectangle one cell

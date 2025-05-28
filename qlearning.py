@@ -14,6 +14,10 @@ from geometry_msgs.msg import PoseStamped
 
 FREQUENCY = 20
 
+# TODO: Make sure goal_dir part of state is relative to robot's direction
+# TODO: Add heuristic to make training better
+# TODO: Improved Q-Learning?
+
 
 # Direction definitions
 RIGHT = 0
@@ -21,6 +25,14 @@ UP = 1
 LEFT = 2
 DOWN = 3
 SAME = 4
+
+# Map from robot_facing x goal_global → relative_dir
+RELATIVE_DIRECTION_MAP = [
+    [UP, LEFT,  DOWN, RIGHT],  # Robot facing RIGHT (0)
+    [RIGHT, UP, LEFT,  DOWN],  # Robot facing UP (1)
+    [DOWN, RIGHT, UP, LEFT],   # Robot facing LEFT (2)
+    [LEFT, DOWN, RIGHT, UP],   # Robot facing DOWN (3)
+]
 
 # Action definitions
 FORWARD = 1
@@ -111,7 +123,9 @@ class RobotInfo:
         # Scan the rotated patch
         scan = self.scan(radius_rotated)
 
-        self.current_state = State(scan, self.get_goal_dir())
+        goal_dir = self.get_goal_dir()
+
+        self.current_state = State(scan, goal_dir)
 
         self.previous_map = updated_map
         self.decay_map = updated_decay
@@ -167,16 +181,35 @@ class RobotInfo:
 
         return new_map, updated_decay
 
+    
     def get_goal_dir(self):
         dx = self.goal_loc.x - self.location.x
         dy = self.goal_loc.y - self.location.y
 
-        if abs(dx) > abs(dy):  # horizontal move dominates
-            return RIGHT if dx > 0 else LEFT
-        elif abs(dy) > 0:  # vertical move dominates
-            return DOWN if dy > 0 else UP
+        if dx == 0 and dy == 0:
+            return SAME  # already at goal
+
+        # Determine global goal direction
+        if abs(dx) > abs(dy):
+            global_dir = RIGHT if dx > 0 else LEFT
         else:
-            return SAME 
+            global_dir = DOWN if dy > 0 else UP
+
+        # Convert to relative direction using lookup table
+        relative_dir = RELATIVE_DIRECTION_MAP[self.direction][global_dir]
+        return relative_dir
+    
+    def copy(self):
+        return RobotInfo(
+            location=Location(self.location.x, self.location.y),
+            direction=self.direction,
+            goal_loc=Location(self.goal_loc.x, self.goal_loc.y),
+            scan_radius=self.scan_radius,
+            map_height=self.map_height,
+            map_width=self.map_width
+        )
+
+        
     
     def turn_dir(self, turn_dir):
         if turn_dir == TURN_LEFT:
@@ -237,7 +270,7 @@ class QLearner:
 
             new_distance = self.robot_info.location.square_distance(goal)
             if(new_distance < self.closest_distance):
-                reward += CLOSER_REWARD
+                reward += CLOSER_REWARD * (self.closest_distance - new_distance)
                 self.closest_distance = new_distance
 
             total_reward += reward

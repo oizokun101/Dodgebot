@@ -3,6 +3,7 @@ from collections import defaultdict
 import math
 import random
 from obstacle_move import MovingMap, OCCUPIED, FREE, UNKNOWN, MAP_TOPIC, GRID_HEIGHT, GRID_WIDTH
+from static_map import Map
 
 from nav_msgs.msg import OccupancyGrid
 import rclpy
@@ -11,7 +12,7 @@ from rclpy.node import Node
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
 
-FREQUENCY = 10
+FREQUENCY = 20
 
 
 # Direction definitions
@@ -30,9 +31,9 @@ TURN_RIGHT = 3
 
 # Reward definitions
 GOAL_REWARD = 500
-CLOSER_REWARD = 0.3 # Not using right now
-TIMESTEP_REWARD = -0.2
-COLLISION_REWARD = -40
+CLOSER_REWARD = 10
+TIMESTEP_REWARD = -0.1
+COLLISION_REWARD = -600
 
 class State:
   def __init__(self, radius_map, goal_dir):
@@ -40,7 +41,7 @@ class State:
     self.goal_dir = goal_dir
   
   def __eq__(self, other):
-    return (self.radius_map == other.radius_map).all() and self.goal_dir == other.goal_dir
+    return np.array_equal(self.radius_map, other.radius_map) and self.goal_dir == other.goal_dir
   
   def __hash__(self):
     return hash((self.radius_map.tobytes(), self.goal_dir))
@@ -83,17 +84,33 @@ class RobotInfo:
     def get_state(self, map):
         updated_map = map.copy()
 
-        if(self.previous_map is not None):
+        if self.previous_map is not None:
             updated_map, updated_decay = self.update_change_tracker(self.previous_map, map, self.decay_map)
         else:
             updated_decay = np.zeros_like(updated_map)
 
-        radius = updated_map[max(0, self.goal_loc.y - self.scan_radius):min(self.map_height-1, self.goal_loc.y + self.scan_radius), 
-                max(0, self.goal_loc.x - self.scan_radius):min(self.map_width-1, self.goal_loc.x + self.scan_radius)]
-        
-        radius = np.rot90(radius, self.direction)
-        scan = self.scan(radius)
-        
+        # Pad the map with UNKNOWN (-1) around edges
+        padded_map = np.pad(updated_map, 
+                            pad_width=self.scan_radius, 
+                            mode='constant', 
+                            constant_values=-1)
+
+        # Adjust robot location for padded map coordinates
+        cx = self.location.x + self.scan_radius
+        cy = self.location.y + self.scan_radius
+
+        # Extract fixed-size patch centered at robot
+        radius = padded_map[
+            cy - self.scan_radius : cy + self.scan_radius + 1,
+            cx - self.scan_radius : cx + self.scan_radius + 1
+        ]
+
+        # Rotate patch according to direction (ensure direction is int in [0..3])
+        radius_rotated = np.rot90(radius, k=self.direction)
+
+        # Scan the rotated patch
+        scan = self.scan(radius_rotated)
+
         self.current_state = State(scan, self.get_goal_dir())
 
         self.previous_map = updated_map
@@ -118,10 +135,10 @@ class RobotInfo:
                 if not (0 <= ix < h and 0 <= iy < w):
                     break
 
-                if radius[ix, iy] == 100:
+                if radius[iy, ix] == 100:
                     break
 
-                scan[ix, iy] = 0  # mark visible
+                scan[iy, ix] = 0  # mark visible
                 x += dx * 0.2  # smaller steps for smoother rays
                 y += dy * 0.2 
 
@@ -190,7 +207,7 @@ class RobotInfo:
 
 class QLearner:
 
-    def __init__(self, robot_info, training_rounds, map_node, alpha=0.3, gamma=0.9, epsilon=1.0, decay=(1 - 3e-4)):
+    def __init__(self, robot_info, training_rounds, map_node, alpha=0.4, gamma=0.99, epsilon=1.0, decay=(1 - 1e-3)):
         self.robot_info = robot_info
         self.training_rounds = training_rounds
         self.map_node = map_node
@@ -198,6 +215,7 @@ class QLearner:
         self.gamma = gamma
         self.epsilon = epsilon
         self.decay = decay
+        self.closest_distance = self.robot_info.location.square_distance(robot_info.goal_loc)
 
     def play_round(self, start, goal):
         print(f"Playing round from {start} to {goal} with epsilon {self.epsilon}")
@@ -208,8 +226,7 @@ class QLearner:
         step = 0
         path = []
         total_reward = 0
-        while(goal != self.robot_info.location and step < step_limit):
-            prev_distance = self.robot_info.location.square_distance(goal)
+        while(goal != self.robot_info.location and step < step_limit and self.map_node.grid[self.robot_info.location.y, self.robot_info.location.x] != 100):
 
             cur_map = self.map_node.grid
             state = self.robot_info.get_state(cur_map)
@@ -219,8 +236,9 @@ class QLearner:
             reward = self.get_reward(cur_map)
 
             new_distance = self.robot_info.location.square_distance(goal)
-            if(new_distance < prev_distance):
+            if(new_distance < self.closest_distance):
                 reward += CLOSER_REWARD
+                self.closest_distance = new_distance
 
             total_reward += reward
 
@@ -237,7 +255,7 @@ class QLearner:
         if self.robot_info.location == goal:
             print("Found goal")
         print(f"Reward: {total_reward}")
-        print(path)
+        print(len(path))
         return path
 
     def get_exploration_action(self, epsilon):
@@ -270,7 +288,7 @@ class QLearner:
             self.robot_info.turn_dir(action)
 
 class QLearningNode(Node):
-    def __init__(self, robot_info, map_node, episodes=1000):
+    def __init__(self, robot_info, map_node, start, goal, episodes=1000):
         super().__init__('q_learning_node')
         self.sub = self.create_subscription(
             OccupancyGrid, 
@@ -286,8 +304,8 @@ class QLearningNode(Node):
         self.learner = QLearner(robot_info, training_rounds=episodes, map_node=map_node)
         
         self.timer = self.create_timer(1.0 / FREQUENCY, self.train_loop)
-        self.start = Location(1, 1)
-        self.goal = Location(GRID_WIDTH - 2, GRID_HEIGHT - 2)
+        self.start = start
+        self.goal = goal
 
     def map_callback(self, msg: OccupancyGrid):
         grid = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
@@ -302,8 +320,8 @@ class QLearningNode(Node):
             pose = PoseStamped()
             pose.header.frame_id = 'map'
             pose.header.stamp = self.get_clock().now().to_msg()
-            pose.pose.position.x = float(loc.x)
-            pose.pose.position.y = float(loc.y)
+            pose.pose.position.x = float(loc.x + 0.5)
+            pose.pose.position.y = float(loc.y + 0.5) # flip so that y=0 is at the top
             pose.pose.position.z = 0.0
             pose.pose.orientation.w = 1.0
             path_msg.poses.append(pose)
@@ -323,15 +341,20 @@ def main(args=None):
     rclpy.init(args=args)
 
     map_node = MovingMap()
+
+    start = Location(0, 0)
+    goal = Location(GRID_WIDTH - 3, GRID_HEIGHT - 2)
+
+    # map_node = Map()
     robot_info = RobotInfo(
-        location=Location(1, 1),
+        location=start,
         direction=RIGHT,
-        goal_loc=Location(GRID_WIDTH - 2, GRID_HEIGHT - 2),
-        scan_radius=3,
+        goal_loc=goal,
+        scan_radius=2,
         map_height=GRID_HEIGHT,
         map_width=GRID_WIDTH
     )
-    learner_node = QLearningNode(robot_info, map_node)
+    learner_node = QLearningNode(robot_info, map_node, start, goal)
 
     executor = rclpy.executors.MultiThreadedExecutor()
     # executor.add_node(map_node)

@@ -68,9 +68,12 @@ class MovingMap(Node):
         self.origin_x = - (self.width / 2) * self.resolution
         self.origin_y = - (self.height / 2) * self.resolution
         self.obstacles = [
-            DynamicRect(self.height-2, self.width-2,  0, -1),   # right moving left
-            DynamicRect(self.height//2, self.width//2, 1,  0),   # middle moving up
-            DynamicRect(2, 2,  0,  1)                   # left moving right
+            # DynamicRect(self.height-2, self.width-2,  0, -1),   # right moving left
+            # DynamicRect(self.height//2, self.width//2, 1,  0),   # middle moving up
+            # DynamicRect(2, 2,  0,  1)                   # left moving right
+            DynamicRect(self.height-2, self.width-2,  0, 0),   # right moving left
+            DynamicRect(self.height//2, self.width//2, 0,  0),   # middle moving up
+            DynamicRect(2, 2,  0,  0)                   # left moving right
         ]
     
     def make_header(self):

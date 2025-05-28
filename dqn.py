@@ -164,7 +164,6 @@ class DQNLearner:
             self.buffer.push(state, action, next_state, reward)
             state = next_state
 
-            self.buffer.push(state, action, next_state, reward)
             self.optimize_model()
 
             state = next_state

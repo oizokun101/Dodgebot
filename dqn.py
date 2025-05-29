@@ -19,7 +19,7 @@ FREQUENCY = 20
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 64
 MEMORY_SIZE = 10000
-TARGET_UPDATE = 10
+TARGET_UPDATE = 100
 LEARNING_RATE = 1e-3
 
 # Directions
@@ -38,10 +38,11 @@ TURN_RIGHT = 3
 ACTIONS = [FORWARD, BACKWARD, TURN_LEFT, TURN_RIGHT, STOP]
 
 # Rewards
-GOAL_REWARD = 500
+GOAL_REWARD = 100
 CLOSER_REWARD = 10
-TIMESTEP_REWARD = -1
-COLLISION_REWARD = -600
+TIMESTEP_REWARD = -0.1
+COLLISION_REWARD = -100
+STUCK_REWARD = -5
 
 DIR_TO_VEC = {
     RIGHT: (1, 0),
@@ -67,6 +68,58 @@ class ReplayBuffer:
 
     def __len__(self):
         return len(self.buffer)
+    
+import numpy as np
+import random
+from collections import namedtuple
+
+Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+
+# https://arxiv.org/abs/1511.05952 Prioritiezed Replay Buffer
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6):
+        self.capacity = capacity
+        self.alpha = alpha  # how much prioritization is used (0 = uniform)
+        self.buffer = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.pos = 0
+
+    def push(self, *args):
+        max_prio = self.priorities.max() if self.buffer else 1.0
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(Transition(*args))
+        else:
+            self.buffer[self.pos] = Transition(*args)
+
+        self.priorities[self.pos] = max_prio
+        self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, batch_size, beta=0.4):
+        if len(self.buffer) == self.capacity:
+            prios = self.priorities
+        else:
+            prios = self.priorities[:self.pos]
+
+        probs = prios ** self.alpha
+        probs /= probs.sum()
+
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+
+        # Compute importance-sampling weights
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+
+        weights = np.array(weights, dtype=np.float32)
+        return samples, indices, weights
+
+    def update_priorities(self, indices, priorities):
+        for idx, prio in zip(indices, priorities):
+            self.priorities[idx] = prio
+
+    def __len__(self):
+        return len(self.buffer)
 
 class DQN(nn.Module):
     def __init__(self, input_size, hidden_size=128, output_size=5):
@@ -84,7 +137,7 @@ class DQN(nn.Module):
         return self.net(x)
 
 class DQNLearner:
-    def __init__(self, robot_info, map_node, episodes, gamma=0.999, epsilon=1.0, epsilon_min=0.1, decay=0.995):
+    def __init__(self, robot_info, map_node, episodes, gamma=0.999, epsilon=1.0, epsilon_min=0.1, decay=0.999):
         self.robot_info = robot_info
         self.map_node = map_node
         self.episodes = episodes
@@ -94,7 +147,7 @@ class DQNLearner:
         self.decay = decay
         self.closest_distance = float('inf')
 
-        self.buffer = ReplayBuffer(MEMORY_SIZE)
+        self.buffer = PrioritizedReplayBuffer(MEMORY_SIZE)
         input_size = (2 * robot_info.scan_radius + 1) ** 2 + 5  # assuming 1 channel for goal_dir
         self.policy_net = DQN(input_size=input_size, output_size=len(ACTIONS)).to(DEVICE)
         self.target_net = DQN(input_size=input_size, output_size=len(ACTIONS)).to(DEVICE)
@@ -102,7 +155,8 @@ class DQNLearner:
         self.target_net.eval()
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LEARNING_RATE)
-        self.loss_fn = nn.MSELoss()
+        # self.loss_fn = nn.MSELoss()
+        self.loss_fn = torch.nn.SmoothL1Loss(beta=1.0) # Switch to huber loss
         self.steps_done = 0
         self.train_steps = 0
 
@@ -119,19 +173,26 @@ class DQNLearner:
         if len(self.buffer) < BATCH_SIZE:
             return
 
-        transitions = self.buffer.sample(BATCH_SIZE)
+        beta = 0.4  # can be annealed during training
+        transitions, indices, weights = self.buffer.sample(BATCH_SIZE, beta)
         batch = Transition(*zip(*transitions))
 
         state_batch = torch.FloatTensor(np.stack(batch.state)).to(DEVICE)
         action_batch = torch.LongTensor([ACTIONS.index(a) for a in batch.action]).unsqueeze(1).to(DEVICE)
         reward_batch = torch.FloatTensor(batch.reward).unsqueeze(1).to(DEVICE)
         next_state_batch = torch.FloatTensor(np.stack(batch.next_state)).to(DEVICE)
+        weights = torch.FloatTensor(weights).unsqueeze(1).to(DEVICE)
 
         state_action_values = self.policy_net(state_batch).gather(1, action_batch)
         next_state_values = self.target_net(next_state_batch).max(1)[0].detach().unsqueeze(1)
-
         expected_values = reward_batch + self.gamma * next_state_values
-        loss = self.loss_fn(state_action_values, expected_values)
+
+        td_errors = (state_action_values - expected_values).detach().cpu().numpy().squeeze()
+        new_priorities = np.abs(td_errors) + 1e-6  # small epsilon to avoid 0 priority
+
+        self.buffer.update_priorities(indices, new_priorities)
+
+        loss = (self.loss_fn(state_action_values, expected_values) * weights).mean()
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -146,6 +207,7 @@ class DQNLearner:
         self.robot_info.location = Location(start.x, start.y)
         self.robot_info.goal_loc = Location(goal.x, goal.y)
         self.closest_distance = self.robot_info.location.square_distance(goal)
+        self.prev_distance = self.closest_distance
 
         state_obj = self.robot_info.get_state(self.map_node.grid)
         state = self.get_full_state_vector(state_obj)
@@ -177,6 +239,7 @@ class DQNLearner:
                 break
 
         self.epsilon = max(self.epsilon_min, self.epsilon * self.decay)
+        self.prev_distance = self.robot_info.location.square_distance(self.robot_info.goal_loc)
         # print(path)
         return total_reward
     
@@ -184,6 +247,8 @@ class DQNLearner:
         print(f"Training episode with start {start} and goal {goal}")
         self.robot_info.location = Location(start.x, start.y)
         self.robot_info.goal_loc = Location(goal.x, goal.y)
+        self.closest_distance = self.robot_info.location.square_distance(goal)
+        self.prev_distance = self.closest_distance
 
         state_obj = self.robot_info.get_state(self.map_node.grid)
         state = self.get_full_state_vector(state_obj)
@@ -192,17 +257,18 @@ class DQNLearner:
 
         path = [Location(self.robot_info.location.x, self.robot_info.location.y)]
 
+        total_reward = 0
+
         while self.robot_info.location != goal and steps < step_limit:
             action = self.select_action(state, eval_mode=True)
             self.take_action(action)
             self.map_node.publish_map()
 
             reward = self.compute_reward()
+            total_reward += reward
             next_state_obj = self.robot_info.get_state(self.map_node.grid)
             next_state = self.get_full_state_vector(next_state_obj)
             state = next_state
-
-            self.optimize_model()
 
             steps += 1
 
@@ -212,6 +278,8 @@ class DQNLearner:
                 break
 
         # print(path)
+        print("SIMULATED PATH REWARD: ", total_reward)
+        self.prev_distance = self.robot_info.location.square_distance(self.robot_info.goal_loc)
         return path
         # print(f"Simulating path from {start} to {goal}")
         
@@ -253,6 +321,8 @@ class DQNLearner:
         elif robot_info.location == robot_info.goal_loc:
             print(f"Found goal {robot_info.goal_loc}, our location is {robot_info.location}")
             return GOAL_REWARD
+        elif robot_info.location.square_distance(robot_info.goal_loc) == self.prev_distance:
+            return STUCK_REWARD + TIMESTEP_REWARD
         else:
             new_distance = robot_info.location.square_distance(robot_info.goal_loc)
             if(new_distance < self.closest_distance):
@@ -368,7 +438,7 @@ def main(args=None):
         location=start,
         direction=RIGHT,
         goal_loc=goal,
-        scan_radius=2,
+        scan_radius=3,
         map_height=GRID_HEIGHT,
         map_width=GRID_WIDTH
     )

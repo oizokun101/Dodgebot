@@ -259,6 +259,7 @@ class QLearner:
         step = 0
         path = []
         total_reward = 0
+        
         while(goal != self.robot_info.location and step < step_limit and self.map_node.grid[self.robot_info.location.y, self.robot_info.location.x] != 100):
 
             cur_map = self.map_node.grid

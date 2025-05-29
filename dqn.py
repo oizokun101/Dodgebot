@@ -40,7 +40,7 @@ ACTIONS = [FORWARD, BACKWARD, TURN_LEFT, TURN_RIGHT, STOP]
 # Rewards
 GOAL_REWARD = 500
 CLOSER_REWARD = 10
-TIMESTEP_REWARD = -2
+TIMESTEP_REWARD = -1
 COLLISION_REWARD = -600
 
 DIR_TO_VEC = {
@@ -84,7 +84,7 @@ class DQN(nn.Module):
         return self.net(x)
 
 class DQNLearner:
-    def __init__(self, robot_info, map_node, episodes, gamma=0.99, epsilon=1.0, epsilon_min=0.1, decay=0.995):
+    def __init__(self, robot_info, map_node, episodes, gamma=0.999, epsilon=1.0, epsilon_min=0.1, decay=0.995):
         self.robot_info = robot_info
         self.map_node = map_node
         self.episodes = episodes
@@ -142,9 +142,9 @@ class DQNLearner:
             self.target_net.load_state_dict(self.policy_net.state_dict())
 
     def train_episode(self, start, goal):
-        print(f"Training episode with start {start} and goal {goal}")
+        print(f"Training episode with start {start} and goal {goal} with epsilon {self.epsilon}")
         self.robot_info.location = Location(start.x, start.y)
-        self.robot_info.goal_loc = goal
+        self.robot_info.goal_loc = Location(goal.x, goal.y)
         self.closest_distance = self.robot_info.location.square_distance(goal)
 
         state_obj = self.robot_info.get_state(self.map_node.grid)
@@ -153,9 +153,12 @@ class DQNLearner:
         steps = 0
         step_limit = 500
 
+        path = [Location(self.robot_info.location.x, self.robot_info.location.y)]
+
         while self.robot_info.location != goal and steps < step_limit:
             action = self.select_action(state)
             self.take_action(action)
+            self.map_node.publish_map()
 
             reward = self.compute_reward()
             total_reward += reward
@@ -166,45 +169,80 @@ class DQNLearner:
 
             self.optimize_model()
 
-            state = next_state
             steps += 1
+
+            path.append(Location(self.robot_info.location.x, self.robot_info.location.y))
 
             if reward == COLLISION_REWARD:
                 break
 
         self.epsilon = max(self.epsilon_min, self.epsilon * self.decay)
+        # print(path)
         return total_reward
     
     def get_path(self, start, goal):
-        print(f"Simulating path from {start} to {goal}")
-        
-        # Clone robot and set up initial state
-        sim_robot = self.robot_info.copy()
-        sim_robot.location = Location(start.x, start.y)
-        sim_robot.goal_loc = goal
+        print(f"Training episode with start {start} and goal {goal}")
+        self.robot_info.location = Location(start.x, start.y)
+        self.robot_info.goal_loc = Location(goal.x, goal.y)
 
-        path = [Location(start.x, start.y)]
+        state_obj = self.robot_info.get_state(self.map_node.grid)
+        state = self.get_full_state_vector(state_obj)
         steps = 0
         step_limit = 500
 
-        state_obj = sim_robot.get_state(self.map_node.grid)
-        state = self.get_full_state_vector(state_obj)
+        path = [Location(self.robot_info.location.x, self.robot_info.location.y)]
 
-        while sim_robot.location != goal and steps < step_limit:
-            action = self.select_action(state, eval_mode=True)  # Use greedy policy
-            self.take_action(action, sim_robot)
+        while self.robot_info.location != goal and steps < step_limit:
+            action = self.select_action(state, eval_mode=True)
+            self.take_action(action)
+            self.map_node.publish_map()
 
-            reward = self.compute_reward(sim_robot)
+            reward = self.compute_reward()
+            next_state_obj = self.robot_info.get_state(self.map_node.grid)
+            next_state = self.get_full_state_vector(next_state_obj)
+            state = next_state
+
+            self.optimize_model()
+
+            steps += 1
+
+            path.append(Location(self.robot_info.location.x, self.robot_info.location.y))
+
             if reward == COLLISION_REWARD:
                 break
 
-            path.append(Location(sim_robot.location.x, sim_robot.location.y))
-
-            next_state_obj = sim_robot.get_state(self.map_node.grid)
-            state = self.get_full_state_vector(next_state_obj)
-            steps += 1
-
+        # print(path)
         return path
+        # print(f"Simulating path from {start} to {goal}")
+        
+        # # Clone robot and set up initial state
+        # sim_robot = self.robot_info.copy()
+        # sim_robot.location = Location(start.x, start.y)
+        # sim_robot.goal_loc = Location(goal.x, goal.y)
+
+        # path = [Location(start.x, start.y)]
+        # steps = 0
+        # step_limit = 500
+
+        # state_obj = sim_robot.get_state(self.map_node.grid)
+        # state = self.get_full_state_vector(state_obj)
+
+        # while sim_robot.location != goal and steps < step_limit:
+        #     action = self.select_action(state, eval_mode=True)  # Use greedy policy
+        #     self.take_action(action, sim_robot)
+        #     self.map_node.publish_map()
+
+        #     reward = self.compute_reward(sim_robot)
+        #     if reward == COLLISION_REWARD:
+        #         break
+
+        #     path.append(Location(sim_robot.location.x, sim_robot.location.y))
+
+        #     next_state_obj = sim_robot.get_state(self.map_node.grid)
+        #     state = self.get_full_state_vector(next_state_obj)
+        #     steps += 1
+
+        # return path
 
     def compute_reward(self, robot_info=None):
         map = self.map_node.grid
@@ -217,9 +255,11 @@ class DQNLearner:
             return GOAL_REWARD
         else:
             new_distance = robot_info.location.square_distance(robot_info.goal_loc)
-            if new_distance < self.closest_distance:
+            if(new_distance < self.closest_distance):
+                reward = TIMESTEP_REWARD + CLOSER_REWARD * (self.closest_distance - new_distance)
                 self.closest_distance = new_distance
-                return CLOSER_REWARD + TIMESTEP_REWARD
+                return reward
+                
             return TIMESTEP_REWARD
 
     def take_action(self, action, robot_info = None):
@@ -254,6 +294,7 @@ class DQNNode(Node):
     def train_loop(self):
         reward = self.learner.train_episode(self.start, self.goal)
         print(f"Episode complete. Total reward: {reward}")
+        print(f"Node start: {self.start}")
         self.publish_path()
 
     def publish_path(self):
